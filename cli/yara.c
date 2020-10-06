@@ -76,6 +76,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #define MAX_QUEUED_FILES 64
 
+// Jansson for JSON
+#include <jansson.h>
+
 
 typedef struct _MODULE_DATA
 {
@@ -90,6 +93,7 @@ typedef struct _CALLBACK_ARGS
 {
   const char* file_path;
   int current_count;
+  struct stat* file_stat;
 
 } CALLBACK_ARGS;
 
@@ -141,6 +145,7 @@ static bool show_meta = false;
 static bool show_namespace = false;
 static bool show_version = false;
 static bool show_help = false;
+static bool json_output = false;
 static bool ignore_warnings = false;
 static bool fast_scan = false;
 static bool negate = false;
@@ -153,6 +158,7 @@ static int timeout = 1000000;
 static int stack_size = DEFAULT_STACK_SIZE;
 static int threads = YR_MAX_THREADS;
 static int max_strings_per_rule = DEFAULT_MAX_STRINGS_PER_RULE;
+
 
 
 #define USAGE_STRING \
@@ -169,6 +175,9 @@ args_option_t options[] =
 
   OPT_BOOLEAN('c', "count", &print_count_only,
       "print only number of matches"),
+
+  OPT_BOOLEAN('j', "json", &json_output,
+      "write output as JSON"),
 
   OPT_STRING_MULTI('d', "define", &ext_vars, MAX_ARGS_EXT_VAR,
       "define external variable", "VAR=VALUE"),
@@ -264,6 +273,44 @@ MUTEX queue_mutex;
 MUTEX output_mutex;
 
 MODULE_DATA* modules_data_list = NULL;
+
+
+/*
+Get a file extension from a filename (includes leading .)
+Allocates new char string and returns lowercased version of extension
+
+NOTE:  Calling function is responsible for freeing allocated memory.
+
+*/
+char *get_file_extension(char *filename) {
+    char *dot, *ext;
+    int len, i;
+    // Find Dot
+    dot = strrchr(filename, '.');
+    if (!dot || dot == filename) {
+        // No Dot or Dot at beginning
+        // Allocate and return empty string
+        ext = malloc(1*sizeof(char));
+        ext[0] = 0x0;
+        return ext;
+    }
+    // Get size of extension
+    len = strlen(dot);
+    // Allocate
+    ext = malloc(len*sizeof(char));
+    // Single loop to copy string
+    // and convert lowercase conversion
+    for (i = 0; i<len; i++) {
+      if (dot[i] >= 0x41 && dot[i] <= 0x5A) {
+        ext[i] = dot[i] + 0x20;
+      }
+      else {
+        ext[i] = dot[i];
+      }
+    }
+    ext[i] = 0x0;
+    return ext;
+}
 
 
 static int file_queue_init()
@@ -856,7 +903,95 @@ static int handle_message(
 
   show = show && ((!negate && is_matching) || (negate && !is_matching));
 
-  if (show && !print_count_only)
+  if (show && json_output)
+  {
+
+    json_t *yara_result_obj = json_object();
+    
+    // Ruleset
+    json_object_set_new(yara_result_obj, "ruleset", json_string(rule->ns->name));
+    // Rule
+    json_object_set_new(yara_result_obj, "rule", json_string(rule->identifier));
+    // File
+    json_object_set_new(yara_result_obj, "fullpath", json_string(((CALLBACK_ARGS*) data)->file_path));
+    // Tags
+    json_t* tag_array = json_array();
+    yr_rule_tags_foreach(rule, tag)
+    {
+      json_array_append(tag_array, json_string(tag));
+    }
+    json_object_set_new(yara_result_obj, "tags", tag_array);
+
+	// File Stat
+	if (((CALLBACK_ARGS*) data)->file_stat != 0) {
+		json_object_set_new(yara_result_obj, "filesize", json_integer(((CALLBACK_ARGS*) data)->file_stat->st_size));
+		json_object_set_new(yara_result_obj, "mtime", json_integer(((CALLBACK_ARGS*) data)->file_stat->st_mtime));
+		json_object_set_new(yara_result_obj, "atime", json_integer(((CALLBACK_ARGS*) data)->file_stat->st_atime));
+		json_object_set_new(yara_result_obj, "ctime", json_integer(((CALLBACK_ARGS*) data)->file_stat->st_ctime));
+	}
+
+    // String MATCHES
+    YR_STRING* yara_string;
+    json_t *matchlist = json_array();
+    yr_rule_strings_foreach(rule, yara_string)
+    {
+        YR_MATCH* rule_match;   
+        json_t *matchdict = json_object();
+        yr_string_matches_foreach(context, yara_string, rule_match)
+        {
+            
+            // offset
+            json_object_set(matchdict, "offset", json_integer(rule_match->base + rule_match->offset));
+            
+            // length
+            json_object_set(matchdict, "length", json_integer(rule_match->match_length));
+            
+            // data
+            json_t *json_match_string;
+            char* match_string = malloc(rule_match->data_length*4);
+            if (STRING_IS_HEX(yara_string))
+            {
+                for (int i=0, j=0; i<rule_match->data_length; i++, j+=2)
+                {
+                    sprintf(match_string+j, "%s%02X", (i == 0 ? "" : " "), rule_match->data[i]);
+                    if (i>0) {
+                        j++;
+                    }
+                }
+            }
+            else
+            {
+                for (int i=0, j=0; i<rule_match->data_length; i++, j++)
+                {                       
+                    if (rule_match->data[i] >= 32 && rule_match->data[i] <= 126)
+                    {
+                        sprintf(match_string+j, "%c", rule_match->data[i]);
+                    }
+                    else
+                    {
+                        sprintf(match_string+j, "\\x%02X", rule_match->data[i]);
+                        j += 3;
+                    }
+                }   
+            }
+            json_match_string = json_string(match_string);
+            free(match_string);
+            json_object_set(matchdict, "data", json_match_string);
+            json_array_append(matchlist, matchdict);
+        }
+    }
+    json_object_set_new(yara_result_obj, "matches", matchlist);
+    
+    // Write Output to STDOUT
+    char* json_text = json_dumps(yara_result_obj, 0);
+    mutex_lock(&output_mutex);
+    puts(json_text);
+    mutex_unlock(&output_mutex);
+    free(json_text);
+    json_object_clear(yara_result_obj);
+
+  }
+  else if (show && !print_count_only)
   {
     mutex_lock(&output_mutex);
 
@@ -1048,6 +1183,44 @@ static void* scanning_thread(void* param)
     {
       yr_scanner_set_timeout(args->scanner, timeout - elapsed_time);
 
+      /* Dynamically Allocated File-Specific Variables */
+      char* file_name = strrchr(file_path, '/');
+      if (file_name == NULL || *file_name == (char)NULL) {
+        // If search resulted in null pointer or pointer to a null terminator, revert to full path
+        file_name = file_path;
+      }
+      else {
+      	file_name += sizeof(*file_name);
+      }
+      /* File Extension */
+      char *file_ext = get_file_extension(file_name);
+      struct stat file_stat;
+      if (stat(file_path, &file_stat)==0)
+      {
+      	args->callback_args.file_stat = &file_stat;
+        yr_scanner_define_integer_variable(args->scanner, "mtime", file_stat.st_mtime);
+        yr_scanner_define_integer_variable(args->scanner, "atime", file_stat.st_atime);
+        yr_scanner_define_integer_variable(args->scanner, "ctime", file_stat.st_ctime);
+        yr_scanner_define_integer_variable(args->scanner, "crtime", file_stat.st_mtime); // Setting to mtime for now
+      }
+      else {
+      	args->callback_args.file_stat = 0;
+      }
+      yr_scanner_define_string_variable(args->scanner, "filepath", file_path);
+      yr_scanner_define_string_variable(args->scanner, "filename", file_name);
+      yr_scanner_define_string_variable(args->scanner, "extension", file_ext);
+      free(file_ext);
+
+      /*
+      mutex_lock(&output_mutex);
+      fprintf(stderr, "**  filepath: '%s'\n", file_path);
+      fprintf(stderr, "**  filename: '%s'\n\n", file_name);
+      fprintf(stderr, "**     mtime: %ld\n", file_stat.st_mtime);
+      fprintf(stderr, "**     atime: %ld\n", file_stat.st_atime);
+      fprintf(stderr, "**     ctime: %ld\n", file_stat.st_ctime);
+      mutex_unlock(&output_mutex);
+      */
+
       result = yr_scanner_scan_file(args->scanner, file_path);
 
       if (print_count_only)
@@ -1083,6 +1256,38 @@ static int define_external_variables(
     YR_COMPILER* compiler)
 {
   int result = ERROR_SUCCESS;
+
+  /* Dynamically Allocated Default Variables in Yara */
+  if (rules != NULL)
+  {
+    result = yr_rules_define_string_variable(rules, "filepath", "");
+    result = yr_rules_define_string_variable(rules, "filename", "");
+    result = yr_rules_define_string_variable(rules, "extension", "");
+    result = yr_rules_define_string_variable(rules, "ads", "");
+    result = yr_rules_define_boolean_variable(rules, "is_ads", false);
+    result = yr_rules_define_integer_variable(rules, "mtime", 0);
+    result = yr_rules_define_integer_variable(rules, "atime", 0);
+    result = yr_rules_define_integer_variable(rules, "ctime", 0);
+    result = yr_rules_define_integer_variable(rules, "crtime", 0);
+    result = yr_rules_define_string_variable(rules, "process_name", "");
+    result = yr_rules_define_string_variable(rules, "process_parent_name", "");
+    result = yr_rules_define_string_variable(rules, "process_username", "");
+  }
+  if (compiler != NULL)
+  {
+    result = yr_compiler_define_string_variable(compiler, "filepath", "");
+    result = yr_compiler_define_string_variable(compiler, "filename", "");
+    result = yr_compiler_define_string_variable(compiler, "extension", "");
+    result = yr_compiler_define_string_variable(compiler, "ads", "");
+    result = yr_compiler_define_boolean_variable(compiler, "is_ads", false);
+    result = yr_compiler_define_integer_variable(compiler, "mtime", 0);
+    result = yr_compiler_define_integer_variable(compiler, "atime", 0);
+    result = yr_compiler_define_integer_variable(compiler, "ctime", 0);
+    result = yr_compiler_define_integer_variable(compiler, "crtime", 0);
+    result = yr_compiler_define_string_variable(compiler, "process_name", "");
+    result = yr_compiler_define_string_variable(compiler, "process_parent_name", "");
+    result = yr_compiler_define_string_variable(compiler, "process_username", "");
+  }
 
   for (int i = 0; ext_vars[i] != NULL; i++)
   {
@@ -1464,7 +1669,44 @@ int main(
     if (is_integer(argv[argc - 1]))
       result = yr_scanner_scan_proc(scanner, atoi(argv[argc - 1]));
     else
+    {
+      /* Dynamically Allocated File-Specific Variables */
+      char *file_path = (char*)argv[argc - 1];
+      char* file_name = strrchr(file_path, '/');
+      if (file_name == NULL || *file_name == (char)NULL) {
+        // If search resulted in null pointer or pointer to a null terminator, revert to full path
+        file_name = file_path;
+      }
+      else {
+      	file_name += sizeof(*file_name);
+      }
+      /* File Extension */
+      char *file_ext = get_file_extension(file_name);
+      struct stat file_stat;
+      if (stat(file_path, &file_stat)==0)
+      {
+        yr_scanner_define_integer_variable(scanner, "mtime", file_stat.st_mtime);
+        yr_scanner_define_integer_variable(scanner, "atime", file_stat.st_atime);
+        yr_scanner_define_integer_variable(scanner, "ctime", file_stat.st_ctime);
+        yr_scanner_define_integer_variable(scanner, "crtime", file_stat.st_mtime); // Setting to mtime for now
+      }
+      yr_scanner_define_string_variable(scanner, "filepath", file_path);
+      yr_scanner_define_string_variable(scanner, "filename", file_name);
+      yr_scanner_define_string_variable(scanner, "extension", file_ext);
+      free(file_ext);
+
+      /*
+      mutex_lock(&output_mutex);
+      fprintf(stderr, "**  filepath: '%s'\n", file_path);
+      fprintf(stderr, "**  filename: '%s'\n\n", file_name);
+      fprintf(stderr, "**     mtime: %ld\n", file_stat.st_mtime);
+      fprintf(stderr, "**     atime: %ld\n", file_stat.st_atime);
+      fprintf(stderr, "**     ctime: %ld\n", file_stat.st_ctime);
+      mutex_unlock(&output_mutex);
+      */
+
       result = yr_scanner_scan_file(scanner, argv[argc - 1]);
+    }
 
     if (result != ERROR_SUCCESS)
     {

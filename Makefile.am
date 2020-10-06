@@ -20,9 +20,9 @@ DIST_SUBDIRS = libyara
 
 ACLOCAL_AMFLAGS=-I m4
 
-bin_PROGRAMS = yara yarac
+bin_PROGRAMS = yarapp yarappc
 
-yara_SOURCES = \
+yarapp_SOURCES = \
   cli/args.c \
   cli/args.h \
   cli/common.h \
@@ -30,15 +30,15 @@ yara_SOURCES = \
   cli/threading.h \
   cli/yara.c
 
-yara_LDADD = libyara/.libs/libyara.a #-Llibyara/.libs -lyara
+yarapp_LDADD = -ljansson libyara/.libs/libyara.a #-Llibyara/.libs -lyara
 
-yarac_SOURCES = \
+yarappc_SOURCES = \
    cli/args.c \
    cli/args.h \
    cli/common.h \
    cli/yarac.c
 
-yarac_LDADD = -Llibyara/.libs -lyara
+yarappc_LDADD = -Llibyara/.libs -lyara
 
 test_alignment_SOURCES = tests/test-alignment.c
 test_arena_SOURCES = tests/test-arena.c
